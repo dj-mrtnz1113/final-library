@@ -21,10 +21,9 @@ $app->post('/user/register', function (Request $request, Response $response, arr
 
     try {
         // Check if the user already exists
-        $sql = "SELECT * FROM users WHERE username = :username";
+        $sql = "SELECT * FROM users WHERE username = ?";
         $stmt = $conn->prepare($sql);
-        $stmt->bindParam(":username", $usr);
-        $stmt->execute();
+        $stmt->execute([$usr]);
         $data = $stmt->fetchAll();
 
         if (count($data) > 0) {
@@ -35,12 +34,11 @@ $app->post('/user/register', function (Request $request, Response $response, arr
             ]));
         } else {
             // If user does not exist, insert new user
-            $sql = "INSERT INTO users (username, password) VALUES (:username, :password)";
+            $sql = "INSERT INTO users (username, password, role_id) VALUES (?, ?, ?)";
             $stmt = $conn->prepare($sql);
-            $stmt->bindParam(":username", $usr);
             $hashedPassword = hash('sha256', $pass);
-            $stmt->bindParam(":password", $hashedPassword);
-            $stmt->execute();
+            $role_id = 2; // Assuming 2 is the role ID for regular users
+            $stmt->execute([$usr, $hashedPassword, $role_id]);
 
             // Return success response
             $response->getBody()->write(json_encode(["status" => "success", "data" => null]));
@@ -56,21 +54,71 @@ $app->post('/user/register', function (Request $request, Response $response, arr
     return $response;
 });
 
-
-//user authentication
-$app->post('/user/authenticate', function (Request $request, Response $response, array $args) {
-    // Decode the JSON input
+// Admin Registration
+$app->post('/admin/register', function (Request $request, Response $response, array $args) {
     $data = json_decode($request->getBody(), true);
     $usr = $data['username'] ?? null;
     $pass = $data['password'] ?? null;
 
-    // Validate input
+    // Get database connection
+    $database = new Database();
+    $conn = $database->getConnection();
+
     if (!$usr || !$pass) {
         $response->getBody()->write(json_encode([
-            "status" => "fail",
-            "data" => ["title" => "Invalid input"]
+            'status' => 'fail',
+            'data' => ['title' => 'Invalid input']
         ]));
         return $response->withHeader('Content-Type', 'application/json')->withStatus(400);
+    }
+
+    try {
+        // Check if the user already exists
+        $sql = "SELECT * FROM users WHERE username = ?";
+        $stmt = $conn->prepare($sql);
+        $stmt->execute([$usr]);
+        $data = $stmt->fetchAll();
+
+        if (count($data) > 0) {
+            $response->getBody()->write(json_encode([
+                "status" => "fail",
+                "data" => ["title" => "Username already exists"]
+            ]));
+            return $response->withHeader('Content-Type', 'application/json')->withStatus(400);
+        } else {
+            // If user does not exist, insert new user with role_id 2 (regular user)
+            $sql = "INSERT INTO users (username, password, role_id) VALUES (?, ?, ?)";
+            $stmt = $conn->prepare($sql);
+            $hashedPassword = hash('sha256', $pass);
+            $role_id = 1; // Regular user role
+            $stmt->execute([$usr, $hashedPassword, $role_id]);
+
+            // Return success response
+            $response->getBody()->write(json_encode([
+                "status" => "success",
+                "data" => null
+            ]));
+            return $response->withHeader('Content-Type', 'application/json')->withStatus(201);
+        }
+
+    } catch (PDOException $e) {
+        $response->getBody()->write(json_encode([
+            'status' => 'fail',
+            'data' => ['title' => 'Error: ' . $e->getMessage()]
+        ]));
+        return $response->withHeader('Content-Type', 'application/json')->withStatus(500);
+    }
+});
+
+//user authentication
+$app->post('/user/authenticate', function (Request $request, Response $response, array $args) {
+    $data = json_decode($request->getBody(), true);
+    $usr = $data['username'] ?? null;
+    $pass = $data['password'] ?? null;
+
+    if (!$usr || !$pass) {
+        $response->getBody()->write(json_encode(["status" => "fail", "data" => ["title" => "Invalid input"]]));
+        return $response->withStatus(400);
     }
 
     // Initialize the database connection
@@ -78,68 +126,60 @@ $app->post('/user/authenticate', function (Request $request, Response $response,
     $conn = $database->getConnection();
 
     try {
-        // Prepare the SQL statement
-        $sql = "SELECT * FROM users WHERE username = :username AND password = :password";
+        // SQL query to get user details including role
+        $sql = "SELECT * FROM users WHERE username = :username";
         $stmt = $conn->prepare($sql);
-
-        // Hash the password
-        $hashedPass = hash('sha256', $pass);
-        $stmt->bindParam(':username', $usr, PDO::PARAM_STR);
-        $stmt->bindParam(':password', $hashedPass, PDO::PARAM_STR);
-
-        $stmt->execute();
+        $stmt->execute([':username' => $usr]);
         $user = $stmt->fetch(PDO::FETCH_ASSOC);
 
-        // If user found, generate JWT
         if ($user) {
-            $key = 'server_hack'; // Secret key
-            $iat = time(); // Issued at
-            $exp = $iat + 3600; // Expiry time (1 hour)
-            $payload = [
-                'iss' => 'https://library.org',
-                'aud' => 'https://library.org',
-                'iat' => $iat,
-                'exp' => $exp,
-                "data" => [
-                    "userid" => $user['userid']
-                ]
-            ];
-            $jwt = JWT::encode($payload, $key, 'HS256');
+            // Check the hashed password
+            $hashedPass = hash('sha256', $pass);
+            if ($user['password'] === $hashedPass) {
+                $key = 'server_hack'; // Secret key
+                $iat = time(); // Issued at
+                $exp = $iat + 3600; // Expiry time (1 hour)
+                $payload = [
+                    'iss' => 'https://library.org',
+                    'aud' => 'https://library.org',
+                    'iat' => $iat,
+                    'exp' => $exp,
+                    'role' => $user['role_id'], // Add role in the payload
+                    "data" => [
+                        "userid" => $user['userid']
+                    ]
+                ];
+                $jwt = JWT::encode($payload, $key, 'HS256');
 
-            // Set token in cookies
-            setcookie(
-                'auth_token', 
-                $jwt, 
-                $exp, 
-                '/',  // Path
-                '',   // Domain (leave empty for current domain)
-                false, // Secure (set to true if using HTTPS)
-                true  // HttpOnly (prevent access via JavaScript)
-            );
+                // Set token in cookies
+                setcookie(
+                    'auth_token', 
+                    $jwt, 
+                    $exp, 
+                    '/',  // Path
+                    '',   // Domain (leave empty for current domain)
+                    false, // Secure (set to true if using HTTPS)
+                    true,  // HttpOnly (prevent access via JavaScript)
+                );
 
-            // Success response with JSON payload
-            $response->getBody()->write(json_encode([
-                "status" => "success", 
-                "message" => "Authentication successful."
-            ]));
-            return $response->withHeader('Content-Type', 'application/json');
+                $response->getBody()->write(json_encode(["status" => "success", "message" => "Authentication successful."]));
+                return $response;
+            } else {
+                $response->getBody()->write(json_encode(["status" => "fail", "data" => ["title" => "Invalid password"]]));
+                return $response->withStatus(401);
+            }
         } else {
-            // Authentication failed
-            $response->getBody()->write(json_encode([
-                "status" => "fail",
-                "data" => ["title" => "Authentication Failed"]
-            ]));
-            return $response->withHeader('Content-Type', 'application/json')->withStatus(401);
+            $response->getBody()->write(json_encode(["status" => "fail", "data" => ["title" => "User not found"]]));
+            return $response->withStatus(404);
         }
     } catch (PDOException $e) {
-        // Database error
-        $response->getBody()->write(json_encode([
-            "status" => "fail",
-            "data" => ["title" => $e->getMessage()]
-        ]));
-        return $response->withHeader('Content-Type', 'application/json')->withStatus(500);
+        $response->getBody()->write(json_encode(["status" => "fail", "data" => ["title" => $e->getMessage()]]));
+        return $response->withStatus(500);
     }
 });
+
+
+
 
 $app->put('/user/update', function (Request $request, Response $response, array $args) {
     $authHeader = $request->getHeader('Authorization');
