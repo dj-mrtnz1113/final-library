@@ -9,6 +9,10 @@ require_once 'db.php';
 
 $app = new \Slim\App;
 
+header("Access-Control-Allow-Origin: *"); // Allow all origins (for testing purposes)
+header("Access-Control-Allow-Methods: POST, GET, OPTIONS");
+header("Access-Control-Allow-Headers: Content-Type");
+
 // User Registration
 $app->post('/user/register', function (Request $request, Response $response, array $args) {
     $data = json_decode($request->getBody());
@@ -37,7 +41,7 @@ $app->post('/user/register', function (Request $request, Response $response, arr
             $sql = "INSERT INTO users (username, password, role_id) VALUES (?, ?, ?)";
             $stmt = $conn->prepare($sql);
             $hashedPassword = hash('sha256', $pass);
-            $role_id = 2; // Assuming 2 is the role ID for regular users
+            $role_id = 2;
             $stmt->execute([$usr, $hashedPassword, $role_id]);
 
             // Return success response
@@ -153,16 +157,22 @@ $app->post('/user/authenticate', function (Request $request, Response $response,
 
                 // Set token in cookies
                 setcookie(
-                    'auth_token', 
-                    $jwt, 
-                    $exp, 
+                    'auth_token',
+                    $jwt,
+                    $exp,
                     '/',  // Path
                     '',   // Domain (leave empty for current domain)
                     false, // Secure (set to true if using HTTPS)
                     true,  // HttpOnly (prevent access via JavaScript)
                 );
 
-                $response->getBody()->write(json_encode(["status" => "success", "message" => "Authentication successful."]));
+                // Return response with role and token
+                $response->getBody()->write(json_encode([
+                    "status" => "success",
+                    "message" => "Authentication successful.",
+                    "role" => $user['role_id'],  // Include the role in the response
+                    "token" => $jwt              // Include the JWT token in the response
+                ]));
                 return $response;
             } else {
                 $response->getBody()->write(json_encode(["status" => "fail", "data" => ["title" => "Invalid password"]]));
@@ -178,6 +188,145 @@ $app->post('/user/authenticate', function (Request $request, Response $response,
     }
 });
 
+
+$app->post('/admin/addbook', function (Request $request, Response $response, array $args) {
+    // Step 1: Check for JWT in FormData
+    $jwt = $_POST['auth_token'] ?? null;
+    if (!$jwt) {
+        return $response->withStatus(401)->withHeader('Content-Type', 'application/json')
+            ->getBody()->write(json_encode(['status' => 'fail', 'message' => 'No token provided.']));
+    }
+
+    try {
+        // Step 2: Decode JWT
+        $key = new Key('server_hack', 'HS256');
+        $decoded = JWT::decode($jwt, $key);
+
+        if ($decoded->role !== 1) {
+            return $response->withStatus(403)->withHeader('Content-Type', 'application/json')
+                ->getBody()->write(json_encode(['status' => 'fail', 'message' => 'Forbidden. Admins only.']));
+        }
+
+        // Step 3: Validate form data
+        $title = $_POST['title'] ?? null;
+        $year = $_POST['year'] ?? null;
+        $authorNames = json_decode($_POST['author_name'] ?? '[]', true);
+
+        if (!$title || !$year || !$authorNames) {
+            return $response->withStatus(400)->withHeader('Content-Type', 'application/json')
+                ->getBody()->write(json_encode(['status' => 'fail', 'message' => 'Missing required fields.']));
+        }
+
+        // Step 4: Handle file upload
+        if (isset($_FILES['thumbnail']) && $_FILES['thumbnail']['error'] === UPLOAD_ERR_OK) {
+            $uploadDir = __DIR__ . '/uploads/';
+            if (!is_dir($uploadDir)) {
+                mkdir($uploadDir, 0755, true); // Create directory if not exists
+            }
+
+            $filename = basename($_FILES['thumbnail']['name']);
+            $filepath = $uploadDir . $filename;
+
+            if (!move_uploaded_file($_FILES['thumbnail']['tmp_name'], $filepath)) {
+                return $response->withStatus(500)->withHeader('Content-Type', 'application/json')
+                    ->getBody()->write(json_encode(['status' => 'fail', 'message' => 'Failed to upload file.']));
+            }
+        } else {
+            return $response->withStatus(400)->withHeader('Content-Type', 'application/json')
+                ->getBody()->write(json_encode(['status' => 'fail', 'message' => 'Thumbnail file is required.']));
+        }
+
+        // Step 5: Insert book and authors into the database
+        $database = new Database();
+        $conn = $database->getConnection();
+
+        $sql = "INSERT INTO books (title, year, thumbnail) VALUES (?, ?, ?)";
+        $stmt = $conn->prepare($sql);
+        $stmt->execute([$title, $year, $filename]); // Store only the filename
+
+        $bookid = $conn->lastInsertId();
+
+        foreach ($authorNames as $authorName) {
+            $authorStmt = $conn->prepare("SELECT authorid FROM authors WHERE name = ?");
+            $authorStmt->execute([$authorName]);
+            $author = $authorStmt->fetch(PDO::FETCH_ASSOC);
+
+            if (!$author) {
+                $authorInsert = "INSERT INTO authors (name) VALUES (?)";
+                $stmt = $conn->prepare($authorInsert);
+                $stmt->execute([$authorName]);
+                $authorId = $conn->lastInsertId();
+            } else {
+                $authorId = $author['authorid'];
+            }
+
+            $bookAuthorInsert = "INSERT INTO book_authors (bookid, authorid) VALUES (?, ?)";
+            $stmt = $conn->prepare($bookAuthorInsert);
+            $stmt->execute([$bookid, $authorId]);
+        }
+
+        // Step 6: Respond with success
+        return $response->withHeader('Content-Type', 'application/json')
+            ->getBody()->write(json_encode([
+                'status' => 'success',
+                'message' => 'Book added successfully.',
+                'book' => ['bookid' => $bookid, 'title' => $title, 'year' => $year, 'thumbnail' => $filename]
+            ]));
+    } catch (Exception $e) {
+        return $response->withStatus(401)->withHeader('Content-Type', 'application/json')
+            ->getBody()->write(json_encode(['status' => 'fail', 'message' => 'Invalid token.']));
+    }
+});
+
+
+$app->get('/books', function (Request $request, Response $response, array $args) {
+    // Step 1: Try to get JWT from cookies, but allow access even without a token
+    $jwt = $_COOKIE['auth_token'] ?? null;
+
+    // If the token is provided, attempt to decode it and validate
+    if ($jwt) {
+        try {
+            // Step 2: Decode and validate the JWT token using the Key class
+            $key = new Key('server_hack', 'HS256'); // Secret key
+            $decoded = JWT::decode($jwt, $key);  // Decode the JWT token
+
+            // Token decoded successfully (can be used for role-based logic, if needed)
+        } catch (Exception $e) {
+            // If decoding fails, return an unauthorized response
+            return $response->withStatus(401)->write(json_encode(['status' => 'fail', 'message' => 'Invalid token.']));
+        }
+    }
+
+    // Step 3: Fetch book details from the database
+    $database = new Database();
+    $conn = $database->getConnection();
+
+    // SQL query to get book info with authors
+    $sql = "
+        SELECT b.bookid, b.title, b.year, b.thumbnail, GROUP_CONCAT(a.name) AS authors
+        FROM books b
+        LEFT JOIN book_authors ba ON b.bookid = ba.bookid
+        LEFT JOIN authors a ON ba.authorid = a.authorid
+        GROUP BY b.bookid
+    ";
+
+    $stmt = $conn->prepare($sql);
+    $stmt->execute();
+
+    // Step 4: Fetch all results
+    $books = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    // Step 5: Prepare response data
+    $responseData = [
+        'status' => 'success',
+        'books' => $books
+    ];
+
+    // Step 6: Set response content type to application/json and return the data
+    return $response
+        ->withHeader('Content-Type', 'application/json')
+        ->write(json_encode($responseData));
+});
 
 
 
@@ -281,11 +430,11 @@ $app->put('/user/update', function (Request $request, Response $response, array 
 $app->post('/books/add', function (Request $request, Response $response, array $args) {
     // Get the Authorization header
     $authHeader = $request->getHeader('Authorization');
-    
+
     if (!$authHeader) {
         return $response->withStatus(401)->getBody()->write(json_encode(array("status" => "fail", "data" => array("title" => "No token provided"))));
     }
-    
+
     $jwt = str_replace('Bearer ', '', $authHeader[0]);
     $key = 'server_hack';
 
